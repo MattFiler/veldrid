@@ -9,6 +9,14 @@ using Veldrid.NeoDemo.Objects;
 using Veldrid.StartupUtilities;
 using Veldrid.Utilities;
 using Veldrid.Sdl2;
+using CATHODE;
+using CathodeLib;
+using static System.Formats.Asn1.AsnWriter;
+using System.Xml.Linq;
+using CATHODE.Scripting;
+using System.Linq;
+using CATHODE.Scripting.Internal;
+using static CathodeLib.Level;
 
 namespace Veldrid.NeoDemo
 {
@@ -56,7 +64,7 @@ namespace Veldrid.NeoDemo
                 WindowWidth = 960,
                 WindowHeight = 540,
                 WindowInitialState = WindowState.Normal,
-                WindowTitle = "Veldrid NeoDemo"
+                WindowTitle = "Composite Viewer"
             };
             GraphicsDeviceOptions gdOptions = new GraphicsDeviceOptions(false, null, false, ResourceBindingModel.Improved, true, true, _colorSrgb);
 #if DEBUG
@@ -124,8 +132,34 @@ namespace Veldrid.NeoDemo
             ImGui.StyleColorsClassic();
         }
 
+        Commands commands;
+        RenderableElements reds;
+        List<ConstructedMeshInfo> constructedMeshes;
         private void AddSponzaAtriumObjects()
         {
+            string level = "G:\\SteamLibrary\\steamapps\\common\\Alien Isolation\\DATA\\ENV\\PRODUCTION\\bsp_torrens";
+
+            Console.WriteLine("Loading WORLD");
+            commands = new Commands(level + "/WORLD/COMMANDS.PAK");
+            reds = new RenderableElements(level + "/WORLD/REDS.BIN");
+
+            constructedMeshes = new List<ConstructedMeshInfo>();
+            Console.WriteLine("Loading RENDERABLE");
+            {
+                Models models = new Models(level + "/RENDERABLE/LEVEL_MODELS.PAK");
+
+                //Add all models from the level to the scene
+                int maxIndex = 0;
+                foreach (RenderableElements.Element element in reds.Entries)
+                    if (element.ModelIndex > maxIndex) maxIndex = element.ModelIndex;
+                for (int i = 0; i < maxIndex; i++)
+                    constructedMeshes.Add(models?.GetAtWriteIndex(i)?.ToMesh());
+            }
+
+            Console.WriteLine("Parsing COMMANDS");
+            ParseComposite(commands.EntryPoints[0], Vector3.Zero, Quaternion.Identity, new List<OverrideEntity>());
+
+            /*
             ObjParser parser = new ObjParser();
             using (FileStream objStream = File.OpenRead(AssetHelper.GetPath("Models/SponzaAtrium/sponza.obj")))
             {
@@ -176,6 +210,120 @@ namespace Veldrid.NeoDemo
                         Quaternion.Identity,
                         scale,
                         group.Name);
+                }
+            }
+            */
+        }
+
+        void ParseComposite(Composite composite, Vector3 position, Quaternion rotation, List<OverrideEntity> overrides)
+        {
+            if (composite == null) return;
+            List<Entity> entities = composite.GetEntities();
+
+            //Compile all appropriate overrides, and keep the hierarchies trimmed so that index zero is accurate to this composite
+            List<OverrideEntity> trimmedOverrides = new List<OverrideEntity>();
+            for (int i = 0; i < overrides.Count; i++)
+            {
+                overrides[i].connectedEntity.hierarchy.RemoveAt(0);
+                if (overrides[i].connectedEntity.hierarchy.Count != 0)
+                    trimmedOverrides.Add(overrides[i]);
+            }
+            trimmedOverrides.AddRange(composite.overrides);
+            overrides = trimmedOverrides;
+
+            //Parse all functions in this composite & handle them appropriately
+            foreach (FunctionEntity function in composite.functions)
+            {
+                //Jump through to the next composite
+                if (!CommandsUtils.FunctionTypeExists(function.function))
+                {
+                    Composite compositeNext = commands.GetComposite(function.function);
+                    if (compositeNext != null)
+                    {
+                        //Find all overrides that are appropriate to take through to the next composite
+                        List<OverrideEntity> overridesNext = trimmedOverrides.FindAll(o => o.connectedEntity.hierarchy[0] == function.shortGUID);
+
+                        //Work out our position, accounting for overrides
+                        Vector3 positionNew; Quaternion rotationNew;
+                        OverrideEntity ovrride = trimmedOverrides.FirstOrDefault(o => o.connectedEntity.hierarchy.Count == 1 && o.connectedEntity.hierarchy[0] == function.shortGUID);
+                        GetEntityTransform(ovrride, out positionNew, out rotationNew);
+                        if (positionNew == Vector3.Zero && rotationNew == Quaternion.Identity)
+                            GetEntityTransform(function, out positionNew, out rotationNew);
+
+                        //Update scene & continue through to next composite
+                        ParseComposite(compositeNext, position + positionNew, rotation + rotationNew, overridesNext);
+                    }
+                }
+
+                //Parse model data
+                else if (CommandsUtils.GetFunctionType(function.function) == FunctionType.ModelReference)
+                {
+                    //TEMP: Instead of parsing all logic, lets just consider models that connect to other entities to be scripted.
+                    if (function.childLinks.Count != 0) continue;
+                    if (entities.FirstOrDefault(o => o.childLinks.FindAll(x => x.childID == function.shortGUID).Count != 0) != null) continue;
+
+                    //Work out our position, accounting for overrides
+                    Vector3 positionNew; Quaternion rotationNew;
+                    OverrideEntity ovrride = trimmedOverrides.FirstOrDefault(o => o.connectedEntity.hierarchy.Count == 1 && o.connectedEntity.hierarchy[0] == function.shortGUID);
+                    GetEntityTransform(ovrride, out positionNew, out rotationNew);
+                    if (positionNew == Vector3.Zero && rotationNew == Quaternion.Identity)
+                        GetEntityTransform(function, out positionNew, out rotationNew);
+
+                    //TODO: do we want to consider resources attached to the entity too? (YES)
+                    Parameter resourceParam = function.GetParameter("resource");
+                    if (resourceParam != null && resourceParam.content != null)
+                    {
+                        switch (resourceParam.content.dataType)
+                        {
+                            case DataType.RESOURCE:
+                                cResource resource = (cResource)resourceParam.content;
+
+                                //TEMP: While we can't parse collision mappings, we rely on both bits of data to form a high-poly collision mesh.
+                                if (resource.value.FirstOrDefault(o => o.entryType == ResourceType.COLLISION_MAPPING) == null ||
+                                    resource.value.FirstOrDefault(o => o.entryType == ResourceType.RENDERABLE_INSTANCE) == null)
+                                    continue;
+
+                                foreach (ResourceReference resourceRef in resource.value)
+                                {
+                                    for (int i = 0; i < resourceRef.count; i++)
+                                    {
+                                        RenderableElements.Element renderable = reds.Entries[resourceRef.index + i];
+
+                                        switch (resourceRef.entryType)
+                                        {
+                                            case ResourceType.RENDERABLE_INSTANCE:
+                                                AddTexturedMesh(constructedMeshes[renderable.ModelIndex], null, null, CommonMaterials.Brick, position + positionNew, rotation + rotationNew, new Vector3(1.0f), renderable.ModelIndex.ToString());
+                                                break;
+                                            case ResourceType.COLLISION_MAPPING:
+                                                //TODO: we should use this data rather than mesh data to reduce overhead
+                                                break;
+                                        }
+                                    }
+                                }
+                                break;
+                        }
+                    }
+                }
+            }
+        }
+
+        void GetEntityTransform(Entity entity, out Vector3 position, out Quaternion rotation)
+        {
+            position = Vector3.Zero;
+            rotation = Quaternion.Identity;
+
+            if (entity == null) return;
+
+            Parameter positionParam = entity.GetParameter("position");
+            if (positionParam != null && positionParam.content != null)
+            {
+                switch (positionParam.content.dataType)
+                {
+                    case DataType.TRANSFORM:
+                        cTransform transform = (cTransform)positionParam.content;
+                        position = transform.position;
+                        rotation = Quaternion.CreateFromYawPitchRoll(transform.rotation.Z, transform.rotation.Y, transform.rotation.X);
+                        break;
                 }
             }
         }
